@@ -24,6 +24,7 @@ class ProteinMPNN(torch.nn.Module):
         atom_context_num=0,
         model_type="protein_mpnn",
         ligand_mpnn_use_side_chain_context=False,
+        debug=False,  # Added debug flag
     ):
         super(ProteinMPNN, self).__init__()
 
@@ -31,8 +32,11 @@ class ProteinMPNN(torch.nn.Module):
         self.node_features = node_features
         self.edge_features = edge_features
         self.hidden_dim = hidden_dim
+        self.num_decoder_layers = num_decoder_layers
+        self.debug = debug
 
-        if self.model_type == "ligand_mpnn":
+        if self.model_type == "ligand_mpnn" or self.model_type == "multistate_ligand_mpnn" \
+                or self.model_type == "multistate_ligand_mpnn_v2":
             self.features = ProteinFeaturesLigand(
                 node_features,
                 edge_features,
@@ -104,9 +108,42 @@ class ProteinMPNN(torch.nn.Module):
 
         self.W_out = torch.nn.Linear(hidden_dim, num_letters, bias=True)
 
+        # Broadcasting layers for multistate model
+        if self.model_type == "multistate_ligand_mpnn":
+            self.broadcast_weights = torch.nn.ModuleList(
+                [
+                    torch.nn.Linear(hidden_dim, 1, bias=False)
+                    for _ in range(num_decoder_layers)
+                ]
+            )
+        if self.model_type == "multistate_ligand_mpnn_v2":
+            self.broadcast_weights = torch.nn.ModuleList(
+                [
+                    torch.nn.Linear(hidden_dim * 2, hidden_dim, bias=True)
+                    for _ in range(num_decoder_layers)
+                ]
+            )
+
         for p in self.parameters():
             if p.dim() > 1:
                 torch.nn.init.xavier_uniform_(p)
+
+    def load_from_ligand_mpnn_checkpoint(self, checkpoint_path):
+        """Load weights from a ligand_mpnn checkpoint"""
+        if self.model_type != "multistate_ligand_mpnn" and self.model_type != "multistate_ligand_mpnn_v2":
+            raise ValueError("This loading function is only for multistate_ligand_mpnn")
+        
+        checkpoint = torch.load(checkpoint_path, map_location=self.W_e.weight.device)
+        state_dict = checkpoint["model_state_dict"]
+        
+        # Remove broadcast weights from loading (they'll keep their random initialization)
+        current_state_dict = self.state_dict()
+        for key in list(state_dict.keys()):
+            if "broadcast_weights" in key:
+                del state_dict[key]
+        
+        # Load compatible weights
+        self.load_state_dict(state_dict, strict=False)
 
     def encode(self, feature_dict):
         # xyz_37 = feature_dict["xyz_37"] #[B,L,37,3] - xyz coordinates for all atoms if needed
@@ -127,7 +164,8 @@ class ProteinMPNN(torch.nn.Module):
         B, L = S_true.shape
         device = S_true.device
 
-        if self.model_type == "ligand_mpnn":
+        if self.model_type == "ligand_mpnn" or self.model_type == "multistate_ligand_mpnn" \
+                or self.model_type == "multistate_ligand_mpnn_v2":
             V, E, E_idx, Y_nodes, Y_edges, Y_m = self.features(feature_dict)
             h_V = torch.zeros((E.shape[0], E.shape[1], E.shape[-1]), device=device)
             h_E = self.W_e(E)
@@ -466,6 +504,169 @@ class ProteinMPNN(torch.nn.Module):
                 "log_probs": all_log_probs,
                 "decoding_order": decoding_order.repeat(B_decoder, 1),
             }
+        return output_dict
+
+    def multistate_sample(self, feature_dict_list):
+        """Sample sequences compatible with multiple conformational states"""
+        if self.model_type != "multistate_ligand_mpnn":
+            raise ValueError("multistate_sample is only for multistate_ligand_mpnn")
+
+        # Validate input
+        if not feature_dict_list or not isinstance(feature_dict_list, list):
+            raise ValueError("feature_dict_list must be a non-empty list")
+        
+        num_states = len(feature_dict_list)
+        if num_states == 0:
+            raise ValueError("At least one state must be provided")
+
+        # Use first feature dict to get basic parameters
+        B_decoder = feature_dict_list[0]["batch_size"]
+        S_true = feature_dict_list[0]["S"]
+        mask = feature_dict_list[0]["mask"]
+        chain_mask = feature_dict_list[0]["chain_mask"]
+        bias = feature_dict_list[0]["bias"]
+        randn = feature_dict_list[0]["randn"]
+        temperature = feature_dict_list[0]["temperature"]
+        symmetry_list_of_lists = feature_dict_list[0]["symmetry_residues"]
+        symmetry_weights_list_of_lists = feature_dict_list[0]["symmetry_weights"]
+
+        B, L = S_true.shape
+        device = S_true.device
+
+        # Encode all states
+        h_V_list = []
+        h_E_list = []
+        E_idx_list = []
+        for feature_dict in feature_dict_list:
+            h_V, h_E, E_idx = self.encode(feature_dict)
+            h_V_list.append(h_V)
+            h_E_list.append(h_E)
+            E_idx_list.append(E_idx)
+
+        chain_mask = mask * chain_mask
+        decoding_order = torch.argsort((chain_mask + 0.0001) * (torch.abs(randn)))
+
+        # Handle symmetry (assuming same symmetry across states)
+        if len(symmetry_list_of_lists[0]) == 0 and len(symmetry_list_of_lists) == 1:
+            E_idx_base = E_idx_list[0].repeat(B_decoder, 1, 1)
+            permutation_matrix_reverse = torch.nn.functional.one_hot(
+                decoding_order, num_classes=L
+            ).float()
+            order_mask_backward = torch.einsum(
+                "ij, biq, bjp->bqp",
+                (1 - torch.triu(torch.ones(L, L, device=device))),
+                permutation_matrix_reverse,
+                permutation_matrix_reverse,
+            )
+            mask_attend = torch.gather(order_mask_backward, 2, E_idx_base).unsqueeze(-1)
+            mask_1D = mask.view([B, L, 1, 1])
+            mask_bw = mask_1D * mask_attend
+            mask_fw = mask_1D * (1.0 - mask_attend)
+
+            # Initialize state-specific variables
+            S_true = S_true.repeat(B_decoder, 1)
+            chain_mask = chain_mask.repeat(B_decoder, 1)
+            mask = mask.repeat(B_decoder, 1)
+            bias = bias.repeat(B_decoder, 1, 1)
+
+            all_probs = torch.zeros((B_decoder, L, 20), device=device)
+            all_log_probs = torch.zeros((B_decoder, L, 21), device=device)
+            S = 20 * torch.ones((B_decoder, L), dtype=torch.int64, device=device)
+            h_S = torch.zeros((B_decoder, L, self.hidden_dim), device=device)
+
+            # Initialize separate h_V stacks for each state
+            h_V_stacks = [
+                [h_V.repeat(B_decoder, 1, 1)] + 
+                [torch.zeros_like(h_V.repeat(B_decoder, 1, 1)) for _ in range(self.num_decoder_layers)]
+                for h_V in h_V_list
+            ]
+            h_E_list = [h_E.repeat(B_decoder, 1, 1, 1) for h_E in h_E_list]
+            E_idx_list = [E_idx.repeat(B_decoder, 1, 1) for E_idx in E_idx_list]
+
+            # Pre-compute encoder embeddings
+            h_EXV_encoder_fw_list = []
+            for state_idx in range(num_states):
+                h_EX_encoder = cat_neighbors_nodes(torch.zeros_like(h_S), h_E_list[state_idx], E_idx_list[state_idx])
+                h_EXV_encoder = cat_neighbors_nodes(h_V_stacks[state_idx][0], h_EX_encoder, E_idx_list[state_idx])
+                h_EXV_encoder_fw_list.append(mask_fw * h_EXV_encoder)
+
+            # Decoding loop
+            for t_ in range(L):
+                t = decoding_order[:, t_]
+                chain_mask_t = torch.gather(chain_mask, 1, t[:, None])[:, 0]
+                mask_t = torch.gather(mask, 1, t[:, None])[:, 0]
+                bias_t = torch.gather(bias, 1, t[:, None, None].repeat(1, 1, 21))[:, 0, :]
+
+                # Process each state
+                for state_idx in range(num_states):
+                    E_idx_t = torch.gather(E_idx_list[state_idx], 1, t[:, None, None].repeat(1, 1, E_idx_list[state_idx].shape[-1]))
+                    h_E_t = torch.gather(h_E_list[state_idx], 1, t[:, None, None, None].repeat(1, 1, h_E_list[state_idx].shape[-2], h_E_list[state_idx].shape[-1]))
+                    h_ES_t = cat_neighbors_nodes(h_S, h_E_t, E_idx_t)
+                    h_EXV_encoder_t = torch.gather(h_EXV_encoder_fw_list[state_idx], 1, t[:, None, None, None].repeat(1, 1, h_EXV_encoder_fw_list[state_idx].shape[-2], h_EXV_encoder_fw_list[state_idx].shape[-1]))
+                    mask_bw_t = torch.gather(mask_bw, 1, t[:, None, None, None].repeat(1, 1, mask_bw.shape[-2], mask_bw.shape[-1]))
+
+                    # Decoder layers with broadcasting
+                    for l, layer in enumerate(self.decoder_layers):
+                        h_ESV_decoder_t = cat_neighbors_nodes(h_V_stacks[state_idx][l], h_ES_t, E_idx_t)
+                        h_V_t = torch.gather(h_V_stacks[state_idx][l], 1, t[:, None, None].repeat(1, 1, h_V_stacks[state_idx][l].shape[-1]))
+                        h_ESV_t = mask_bw_t * h_ESV_decoder_t + h_EXV_encoder_t
+                        state_output = layer(h_V_t, h_ESV_t, mask_V=mask_t)
+                        
+                        # Update this state's stack
+                        h_V_stacks[state_idx][l + 1].scatter_(
+                            1, t[:, None, None].repeat(1, 1, self.hidden_dim), state_output
+                        )
+
+                        # Broadcast to other states
+                        broadcast_weight = self.broadcast_weights[l](state_output)
+                        for other_idx in range(num_states):
+                            if other_idx != state_idx:
+                                h_V_stacks[other_idx][l + 1].scatter_add_(
+                                    1,
+                                    t[:, None, None].repeat(1, 1, self.hidden_dim),
+                                    broadcast_weight * state_output
+                                )
+
+                # Average final h_V_t across states
+                h_V_t = h_V_t = torch.gather(
+                    h_V_stacks[0][-1],
+                    1,
+                    t[:, None, None].repeat(1, 1, h_V_stacks[0][-1].shape[-1]),
+                )[:, 0]
+                for state_idx in range(1, num_states):
+                    h_V_t += torch.gather(
+                        h_V_stacks[state_idx][-1],
+                        1,
+                        t[:, None, None].repeat(1, 1, h_V_stacks[state_idx][-1].shape[-1]),
+                    )[:, 0]
+                h_V_t /= num_states
+                logits = self.W_out(h_V_t)
+                log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+
+                probs = torch.nn.functional.softmax((logits + bias_t) / temperature, dim=-1)
+                probs_sample = probs[:, :20] / torch.sum(probs[:, :20], dim=-1, keepdim=True)
+                S_t = torch.multinomial(probs_sample, 1)[:, 0]
+
+                all_probs.scatter_(1, t[:, None, None].repeat(1, 1, 20), (chain_mask_t[:, None, None] * probs_sample[:, None, :]).float())
+                all_log_probs.scatter_(1, t[:, None, None].repeat(1, 1, 21), (chain_mask_t[:, None, None] * log_probs[:, None, :]).float())
+                S_true_t = torch.gather(S_true, 1, t[:, None])[:, 0]
+                S_t = (S_t * chain_mask_t + S_true_t * (1.0 - chain_mask_t)).long()
+                h_S.scatter_(1, t[:, None, None].repeat(1, 1, h_S.shape[-1]), self.W_s(S_t)[:, None, :])
+                S.scatter_(1, t[:, None], S_t[:, None])
+
+            output_dict = {
+                "S": S,
+                "sampling_probs": all_probs,
+                "log_probs": all_log_probs,
+                "decoding_order": decoding_order,
+            }
+            if self.debug:
+                output_dict["h_V_stacks"] = h_V_stacks
+        else:
+            # The original code had its own multistate sampling logic for symmetry, so this function doesn't implement
+            # that since it's ambiguous whether we should keep the existing code or rewrite it to use our new model for 
+            # symmetry. You can implement this part if needed.
+            raise NotImplementedError("Multistate sampling with symmetry is not implemented")
         return output_dict
 
     def single_aa_score(self, feature_dict, use_sequence: bool):
