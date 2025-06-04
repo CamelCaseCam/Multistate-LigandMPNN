@@ -280,10 +280,19 @@ class BidirectionalDiffusion(nn.Module):
 
         return pred_noise_seq, pred_noise_env
 
+class SequenceDecoder(nn.Module):
+    def __init__(self, embed_dim, vocab_size):
+        super().__init__()
+        self.dropout = nn.Dropout(0.8)  # 80% dropout because we want to encourage redundancy in embeddings - 128 dims >> 21 amino acids
+        self.fc1 = nn.Linear(embed_dim, embed_dim)
+        self.fc2 = nn.Linear(embed_dim, vocab_size)
+
+    def forward(self, x):
+        x = self.dropout(x)
+        x = F.gelu(self.fc1(x))
+        return self.fc2(x)
+
 if __name__ == "__main__":
-    # -------------------------------------------------------------
-    # 1) Parameters
-    # -------------------------------------------------------------
     embed_dim = 128
     num_heads = 8
     num_encoder_layers = 3
@@ -295,36 +304,21 @@ if __name__ == "__main__":
     max_len = 512
     batch_size = 8
     learning_rate = 1e-4
-    num_epochs = EPOCHS   # make sure EPOCHS is defined somewhere
+    num_epochs = EPOCHS
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # -------------------------------------------------------------
-    # 2) Build a linear beta schedule (β₁,…,β_T)
-    # -------------------------------------------------------------
-    # Here we choose a simple linear schedule from β₁=1e-4 up to β_T=0.02.
-    # You can adjust these endpoints or try cosine schedules, etc.
     beta_start = 1e-4
     beta_end   = 2e-2
     betas = torch.linspace(beta_start, beta_end, num_timesteps, device=device)  # shape: [T]
 
-    # α_t = 1 - β_t
-    alphas = 1.0 - betas                                                             # shape: [T]
-    # \bar α_t = ∏_{i=1}^t α_i
-    alpha_bars = torch.cumprod(alphas, dim=0)                                        # shape: [T]
+    alphas = 1.0 - betas
+    alpha_bars = torch.cumprod(alphas, dim=0)
 
-    # For convenience, we'll later index alpha_bars[t-1] when t ∈ [1…T].
-
-    # -------------------------------------------------------------
-    # 3) Get PDB lists
-    # -------------------------------------------------------------
     common_pdbs = [f.split('.')[0] for f in os.listdir('training/data/common') if f.endswith('.pt')]
     uncommon_pdbs = [f.split('.')[0] for f in os.listdir('training/data/uncommon') if f.endswith('.pt')]
     all_pdbs = [(pdb, False) for pdb in common_pdbs] + [(pdb, True) for pdb in uncommon_pdbs]
 
-    # -------------------------------------------------------------
-    # 4) Instantiate models + optimizer
-    # -------------------------------------------------------------
     encoder = Encoder(
         autoencoder,
         vocab_size=len(amino_acid_tokens),
@@ -341,14 +335,13 @@ if __name__ == "__main__":
         num_timesteps=num_timesteps
     ).to(device)
 
+    decoder = SequenceDecoder(embed_dim, len(amino_acid_tokens)).to(device)
+
     optimizer = torch.optim.Adam(
-        list(diffusion.parameters()) + list(encoder.parameters()),
+        list(diffusion.parameters()) + list(encoder.parameters()) + list(decoder.parameters()),
         lr=learning_rate
     )
 
-    # -------------------------------------------------------------
-    # 5) Training loop
-    # -------------------------------------------------------------
     for epoch in (pbar := tqdm.tqdm(range(num_epochs))):
         random.shuffle(all_pdbs)
         total_loss = 0.0
@@ -359,20 +352,15 @@ if __name__ == "__main__":
             pdb_ids = [p[0] for p in batch]
             is_uncommon = [p[1] for p in batch]
 
-            # ---------------------------------------------------------
-            # a) Load data (seq_emb, atomic_emb) from your encoder
-            # ---------------------------------------------------------
             sequences, coords, types = load_pdbs(pdb_ids, is_uncommon, max_len)
             if sequences is None:
                 continue
 
-            # seq_emb:   [batch_size, seq_len, embed_dim]
-            # atomic_emb:[batch_size, num_atoms, embed_dim]    (for example)
             seq_emb, atomic_emb = encoder(sequences, coords, types)
 
-            # ---------------------------------------------------------
-            # b) Sample random timesteps t_seq, t_env ∈ {1,…,T}
-            # ---------------------------------------------------------
+            logits = decoder(seq_emb)
+            recon_loss = F.cross_entropy(logits.transpose(1, 2), sequences, ignore_index=amino_acid_tokens.index("X"))
+
             batch_size_actual = sequences.shape[0]
             t_seq = torch.randint(
                 low=1, high=num_timesteps + 1,
@@ -387,24 +375,15 @@ if __name__ == "__main__":
                 dtype=torch.long
             )  # shape: [B]
 
-            # ---------------------------------------------------------
-            # c) For each example, look up ᾱ_t  = alpha_bars[t-1]
-            # ---------------------------------------------------------
             # alpha_bars[t_seq - 1] : [B]
             alpha_bar_seq = alpha_bars[t_seq - 1].view(-1, 1, 1)   # reshape to [B,1,1] for broadcasting
             alpha_bar_env = alpha_bars[t_env - 1].view(-1, 1, 1)   # shape [B,1,1]
 
-            # ---------------------------------------------------------
-            # d) Sample noise ε ∼ N(0,I)  for both streams
-            # ---------------------------------------------------------
+
             # (Match the shape of seq_emb / atomic_emb exactly.)
             noise_seq = torch.randn_like(seq_emb)      # [B, seq_len, embed_dim]
             noise_env = torch.randn_like(atomic_emb)   # [B, num_atoms, embed_dim]
 
-            # ---------------------------------------------------------
-            # e) Construct the noisy inputs x_t  via exact DDPM formula:
-            #    x_t = sqrt(alpha_bar_t) * x_0 + sqrt(1 - alpha_bar_t) * ε
-            # ---------------------------------------------------------
             sqrt_alpha_bar_seq = torch.sqrt(alpha_bar_seq)            # [B,1,1]
             sqrt_one_minus_alpha_bar_seq = torch.sqrt(1 - alpha_bar_seq)  # [B,1,1]
 
@@ -417,36 +396,16 @@ if __name__ == "__main__":
             # noisy_env: [B, num_atoms, embed_dim]
             noisy_env = sqrt_alpha_bar_env * atomic_emb + sqrt_one_minus_alpha_bar_env * noise_env
 
-            # ---------------------------------------------------------
-            # f) Run the diffusion network to predict the noise at step t
-            #
-            #    Your BidirectionalDiffusion should accept:
-            #      (noisy_seq, noisy_env, t_seq, t_env)
-            #
-            #    and output:
-            #      (pred_noise_seq, pred_noise_env),
-            #    where each prediction has the same shape as the original noise.
-            # ---------------------------------------------------------
             pred_noise_seq, pred_noise_env = diffusion(noisy_seq, noisy_env, t_seq, t_env)
 
-            # ---------------------------------------------------------
-            # g) Compute the MSE loss against the *true* ε
-            #    (This matches the DDPM derivation exactly.)
-            # ---------------------------------------------------------
             loss_seq = F.mse_loss(pred_noise_seq, noise_seq)
             loss_env = F.mse_loss(pred_noise_env, noise_env)
-            loss = loss_seq + loss_env
+            loss = loss_seq + loss_env + recon_loss
 
-            # ---------------------------------------------------------
-            # h) Backprop + step
-            # ---------------------------------------------------------
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
-            # ---------------------------------------------------------
-            # i) Logging
-            # ---------------------------------------------------------
             num_iters += 1
             total_loss += loss.item()
             avg_loss = total_loss / num_iters
@@ -454,8 +413,6 @@ if __name__ == "__main__":
                 f"Epoch {epoch+1}/{num_epochs}  batch {i}/{len(all_pdbs)}  Loss: {avg_loss:.4f}"
             )
 
-    # -------------------------------------------------------------
-    # 6) Save the diffusion model (and optionally the encoder)
-    # -------------------------------------------------------------
     torch.save(diffusion.state_dict(), 'bidirectional_diffusion_8l.pth')
     torch.save(encoder.state_dict(),   'encoder_8l.pth')
+    torch.save(decoder.state_dict(), 'sequence_decoder.pth')

@@ -131,3 +131,7 @@ dmypy.json
 # Training data
 training/data/
 training/pdbs/
+
+# Weights (should be distributed off github)
+*.pt
+*.pth
